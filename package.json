@@ -1,0 +1,28 @@
+{
+  "name": "chainflow-facilitator",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@hono/node-server": "^1.19.12",
+    "@scure/base": "^2.0.0",
+    "@solana/kit": "^5.5.1",
+    "@x402/core": "^2.9.0",
+    "@x402/svm": "^2.9.0",
+    "dotenv": "^17.4.0",
+    "hono": "^4.12.10"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
