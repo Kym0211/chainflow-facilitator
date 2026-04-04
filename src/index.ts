@@ -32,10 +32,15 @@ const svmSigner = toFacilitatorSvmSigner(keypair, {
 
 const facilitator = new x402Facilitator();
 
+// facilitator.register(
+//   "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+//   new ExactSvmScheme(svmSigner)
+// );   // for mainnet 
+
 facilitator.register(
-  "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+  "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
   new ExactSvmScheme(svmSigner)
-);
+);   // for devnet
 
 const app = new Hono();
 
@@ -89,6 +94,6 @@ app.get("/supported", (c) => {
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
   console.log(`Chainflow facilitator running on http://localhost:${info.port}`);
-  console.log(`Network: Solana mainnet`);
+  console.log(`Network: Solana devnet (EtWTRABZaYq6iMfeYKouRu166VU2xqa1)`);
   console.log(`RPC: ${RPC_URL || "default (public)"}`);
 });
