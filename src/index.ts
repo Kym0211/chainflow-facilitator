@@ -1,6 +1,6 @@
 import { serve } from "@hono/node-server";
 import { base58 } from "@scure/base";
-import { createKeyPairSignerFromBytes, createSolanaRpc, mainnet } from "@solana/kit";
+import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { toFacilitatorSvmSigner } from "@x402/svm";
 import { ExactSvmScheme } from "@x402/svm/exact/facilitator";
@@ -8,15 +8,21 @@ import { createApp, type ReadinessProbe } from "./app.js";
 import { verifyCounter, settleCounter, shutdownMetrics } from "./metrics.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { logger } from "./logger.js";
+import { createFailoverRpc, parseRpcUrls } from "./rpc.js";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const PORT = parseInt(process.env.PORT || "4022");
-const RPC_URL = process.env.RPC_URL;
 const SVM_PRIVATE_KEY = process.env.SVM_PRIVATE_KEY;
 const TRUST_PROXY = process.env.TRUST_PROXY === "true";
+
+const RPC_URLS = parseRpcUrls();
+if (RPC_URLS.length === 0) {
+  console.error("RPC_URLS (or legacy RPC_URL) is required in .env");
+  process.exit(1);
+}
 
 if (!SVM_PRIVATE_KEY) {
   console.error("SVM_PRIVATE_KEY is required in .env");
@@ -30,9 +36,12 @@ const privateKeyBytes = SVM_PRIVATE_KEY.startsWith("[")
 const keypair = await createKeyPairSignerFromBytes(privateKeyBytes);
 logger.info("Wallet loaded", { address: keypair.address.toString() });
 
-const svmSigner = toFacilitatorSvmSigner(keypair, {
-  defaultRpcUrl: RPC_URL,
-});
+// Single failover RPC shared by the signer and the readiness probe:
+// if the first URL is down, both writes and the readyz check fail over.
+const failoverRpc = createFailoverRpc(RPC_URLS, { rounds: 2 });
+// Pass as a per-network map — toFacilitatorSvmSigner's "single RPC" detection
+// relies on `"getBalance" in rpc` which fails on @solana/kit's Proxy-based RPCs.
+const svmSigner = toFacilitatorSvmSigner(keypair, { [NETWORK]: failoverRpc });
 
 const facilitator = new x402Facilitator()
   .onAfterVerify(async () => verifyCounter.add(1, { result: "success" }))
@@ -46,8 +55,7 @@ const rateLimiter = new RateLimiter(100, 60_000);
 
 const readinessProbe: ReadinessProbe = async () => {
   try {
-    const rpc = createSolanaRpc(mainnet(RPC_URL!));
-    const { value } = await rpc.getLatestBlockhash().send();
+    const { value } = await failoverRpc.getLatestBlockhash().send();
     return { ok: true, blockhash: value.blockhash };
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : "Unknown error" };
@@ -67,7 +75,7 @@ const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
   logger.info("Facilitator started", {
     port: info.port,
     network: NETWORK,
-    rpc: RPC_URL || "default",
+    rpcEndpoints: RPC_URLS.length,
     wallet: keypair.address.toString(),
   });
 });
