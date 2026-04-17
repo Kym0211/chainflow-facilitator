@@ -55,3 +55,21 @@ export const settleDuration = meter.createHistogram("facilitator_settle_duration
 export const activeRequests = meter.createUpDownCounter("facilitator_active_requests", {
   description: "Number of requests currently being processed",
 });
+
+// Wallet balance in lamports. Set by a background poller via setWalletBalance()
+// so the gauge callback doesn't issue an RPC on every scrape.
+let lastKnownBalanceLamports: number | null = null;
+
+export function setWalletBalanceLamports(lamports: number): void {
+  lastKnownBalanceLamports = lamports;
+}
+
+meter
+  .createObservableGauge("facilitator_wallet_balance_lamports", {
+    description: "Current lamport balance of the facilitator fee-payer wallet",
+  })
+  .addCallback((result) => {
+    if (lastKnownBalanceLamports !== null) {
+      result.observe(lastKnownBalanceLamports);
+    }
+  });

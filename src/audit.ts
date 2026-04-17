@@ -1,13 +1,40 @@
 import { closeSync, fdatasyncSync, openSync, writeSync } from "node:fs";
 
 /**
- * One line in the audit log. Emitted exactly once per /settle attempt
- * that reached the facilitator (not for body-limit or missing-field rejects).
+ * One line in the audit log.
+ *
+ * Two phases are emitted for every /settle attempt that reaches the facilitator:
+ *  1. `phase: "attempt"` BEFORE calling facilitator.settle — durably records
+ *     what we are about to try. If the process crashes before the complete
+ *     record is written, an operator sees an orphan "attempt" and can reconcile
+ *     against on-chain state (was the tx submitted? did it confirm?).
+ *  2. `phase: "complete"` AFTER the settle resolves — records success/failure
+ *     and the tx signature. Correlates back to the attempt via requestId.
+ *
+ * Body-limit and missing-field rejects never produce either phase (no settle
+ * was attempted).
  */
-export interface AuditRecord {
+export type AuditRecord =
+  | AuditAttemptRecord
+  | AuditCompleteRecord;
+
+export interface AuditAttemptRecord {
   timestamp: string;
   requestId: string;
   operation: "settle";
+  phase: "attempt";
+  network?: string;
+  scheme?: string;
+  asset?: string;
+  amount?: string;
+  payTo?: string;
+}
+
+export interface AuditCompleteRecord {
+  timestamp: string;
+  requestId: string;
+  operation: "settle";
+  phase: "complete";
   result: "success" | "failure" | "error";
   durationMs: number;
   network?: string;

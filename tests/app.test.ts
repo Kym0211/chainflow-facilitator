@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, type FacilitatorLike, type ReadinessProbe } from "../src/app.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { InMemoryAuditSink } from "../src/audit.js";
+import { InMemoryIdempotencyCache } from "../src/idempotency.js";
 
 function buildDeps(overrides: Partial<Parameters<typeof createApp>[0]> = {}) {
   const facilitator: FacilitatorLike = {
@@ -158,7 +159,7 @@ describe("createApp", () => {
       },
     };
 
-    it("writes one success record per successful settle", async () => {
+    it("writes attempt + complete records per successful settle, correlated by requestId", async () => {
       const sink = new InMemoryAuditSink();
       const d = buildDeps({ auditSink: sink });
       const app2 = createApp(d);
@@ -169,22 +170,64 @@ describe("createApp", () => {
         body: JSON.stringify(settleBody),
       });
       expect(res.status).toBe(200);
-      expect(sink.records).toHaveLength(1);
-      expect(sink.records[0]).toMatchObject({
+      expect(sink.records).toHaveLength(2);
+
+      const [attempt, complete] = sink.records;
+      expect(attempt).toMatchObject({
+        phase: "attempt",
         operation: "settle",
-        result: "success",
-        transaction: "sig-123",
         network: "solana:test",
         asset: "USDC",
         amount: "1000",
         payTo: "merchant-addr",
       });
-      expect(sink.records[0].requestId).toBeDefined();
-      expect(sink.records[0].durationMs).toBeGreaterThanOrEqual(0);
+      expect(complete).toMatchObject({
+        phase: "complete",
+        operation: "settle",
+        result: "success",
+        transaction: "sig-123",
+        network: "solana:test",
+      });
+      expect(attempt.requestId).toBe(complete.requestId);
       d.rateLimiter.dispose();
     });
 
-    it("writes a failure record when facilitator reports success=false", async () => {
+    it("attempt record is written BEFORE facilitator.settle is called", async () => {
+      const sink = new InMemoryAuditSink();
+      const order: string[] = [];
+      const settleMock = vi.fn(async () => {
+        order.push("settle-called");
+        return { success: true, transaction: "sig-ok" };
+      });
+      // Wrap the sink to observe ordering.
+      const observingSink = {
+        async record(e: Parameters<typeof sink.record>[0]) {
+          order.push(`record-${e.phase}`);
+          await sink.record(e);
+        },
+        close: sink.close.bind(sink),
+      };
+      const d = buildDeps({
+        facilitator: {
+          verify: vi.fn(),
+          settle: settleMock,
+          getSupported: vi.fn(() => ({ kinds: [] })),
+        },
+        auditSink: observingSink,
+      });
+      const app2 = createApp(d);
+
+      await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      // The pre-write must precede the settle call; complete follows.
+      expect(order).toEqual(["record-attempt", "settle-called", "record-complete"]);
+      d.rateLimiter.dispose();
+    });
+
+    it("writes failure complete record when facilitator reports success=false", async () => {
       const sink = new InMemoryAuditSink();
       const d = buildDeps({
         facilitator: {
@@ -204,15 +247,16 @@ describe("createApp", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(settleBody),
       });
-      expect(sink.records).toHaveLength(1);
-      expect(sink.records[0]).toMatchObject({
+      expect(sink.records).toHaveLength(2);
+      const complete = sink.records.find((r) => r.phase === "complete")!;
+      expect(complete).toMatchObject({
         result: "failure",
         error: "transaction_simulation_failed",
       });
       d.rateLimiter.dispose();
     });
 
-    it("writes an error record when the facilitator throws", async () => {
+    it("writes error complete record when the facilitator throws", async () => {
       const sink = new InMemoryAuditSink();
       const d = buildDeps({
         facilitator: {
@@ -232,8 +276,9 @@ describe("createApp", () => {
         body: JSON.stringify(settleBody),
       });
       expect(res.status).toBe(500);
-      expect(sink.records).toHaveLength(1);
-      expect(sink.records[0]).toMatchObject({
+      expect(sink.records).toHaveLength(2);
+      const complete = sink.records.find((r) => r.phase === "complete")!;
+      expect(complete).toMatchObject({
         result: "error",
         error: "RPC unreachable",
       });
@@ -273,6 +318,134 @@ describe("createApp", () => {
       });
       expect(res.status).toBe(200);
       expect(flaky.record).toHaveBeenCalled();
+      d.rateLimiter.dispose();
+    });
+  });
+
+  describe("idempotency", () => {
+    const settleBody = {
+      paymentPayload: { x402Version: 2, payload: { transaction: "signed-tx-base64" } },
+      paymentRequirements: {
+        scheme: "exact",
+        network: "solana:test",
+        asset: "USDC",
+        amount: "1000",
+        payTo: "merchant-addr",
+      },
+    };
+
+    it("short-circuits a duplicate /settle to the cached response", async () => {
+      const cache = new InMemoryIdempotencyCache(60_000, 3_600_000);
+      const settleMock = vi.fn(async () => ({ success: true, transaction: "sig-xyz" }));
+      const d = buildDeps({
+        facilitator: {
+          verify: vi.fn(),
+          settle: settleMock,
+          getSupported: vi.fn(() => ({ kinds: [] })),
+        },
+        idempotencyCache: cache,
+      });
+      const app2 = createApp(d);
+
+      const first = await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      const second = await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(await second.json()).toEqual({ success: true, transaction: "sig-xyz" });
+      expect(second.headers.get("x-idempotent-replay")).toBe("cached");
+      // Underlying settle called exactly once — no double-spend attempt.
+      expect(settleMock).toHaveBeenCalledTimes(1);
+      cache.dispose();
+      d.rateLimiter.dispose();
+    });
+
+    it("coalesces concurrent duplicate settles into one upstream call", async () => {
+      const cache = new InMemoryIdempotencyCache(60_000, 3_600_000);
+      let resolveSettle: (v: { success: boolean; transaction: string }) => void = () => {};
+      const settleMock = vi.fn(
+        () =>
+          new Promise<{ success: boolean; transaction: string }>((r) => {
+            resolveSettle = r;
+          }),
+      );
+      const d = buildDeps({
+        facilitator: {
+          verify: vi.fn(),
+          settle: settleMock,
+          getSupported: vi.fn(() => ({ kinds: [] })),
+        },
+        idempotencyCache: cache,
+      });
+      const app2 = createApp(d);
+
+      // Fire two requests before the first settles. We need two short delays:
+      //   (1) after p1 — lets p1 run past cache.reserve and start awaiting settle
+      //   (2) after p2 — lets p2's handler actually reach cache.inflight
+      // Without (2), microtask ordering means p2's handler starts AFTER
+      // resolveSettle + p1 completes + p1 writes to cache, and p2 would see
+      // the cached entry instead of coalescing.
+      const p1 = app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      const p2 = app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+
+      resolveSettle({ success: true, transaction: "coalesced-sig" });
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.status).toBe(200);
+      expect(r2.status).toBe(200);
+      expect(await r2.json()).toEqual({ success: true, transaction: "coalesced-sig" });
+      expect(r2.headers.get("x-idempotent-replay")).toBe("coalesced");
+      expect(settleMock).toHaveBeenCalledTimes(1);
+      cache.dispose();
+      d.rateLimiter.dispose();
+    });
+
+    it("treats distinct signed-tx payloads as distinct settles", async () => {
+      const cache = new InMemoryIdempotencyCache(60_000, 3_600_000);
+      const settleMock = vi.fn(async () => ({ success: true, transaction: "sig" }));
+      const d = buildDeps({
+        facilitator: {
+          verify: vi.fn(),
+          settle: settleMock,
+          getSupported: vi.fn(() => ({ kinds: [] })),
+        },
+        idempotencyCache: cache,
+      });
+      const app2 = createApp(d);
+
+      await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...settleBody,
+          paymentPayload: { ...settleBody.paymentPayload, payload: { transaction: "different-tx" } },
+        }),
+      });
+
+      expect(settleMock).toHaveBeenCalledTimes(2);
+      cache.dispose();
       d.rateLimiter.dispose();
     });
   });

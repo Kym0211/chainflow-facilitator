@@ -7,8 +7,10 @@ import { activeRequests, verifyDuration, settleDuration } from "./metrics.js";
 import type { RateLimiter } from "./rate-limiter.js";
 import { logger } from "./logger.js";
 import { randomUUID } from "node:crypto";
-import type { AuditRecord, AuditSink } from "./audit.js";
+import type { AuditAttemptRecord, AuditCompleteRecord, AuditSink } from "./audit.js";
 import { NullAuditSink } from "./audit.js";
+import type { IdempotencyCache } from "./idempotency.js";
+import { idempotencyKey } from "./idempotency.js";
 
 export type Variables = { requestId: string };
 
@@ -43,6 +45,12 @@ export interface AppDeps {
    * (no settle was attempted). Defaults to NullAuditSink.
    */
   auditSink?: AuditSink;
+  /**
+   * Idempotency cache for /settle. When provided, duplicate settles keyed
+   * by (signed-tx, requirements) short-circuit to the cached response.
+   * Omit to disable dedup (useful if you've moved dedup to an upstream layer).
+   */
+  idempotencyCache?: IdempotencyCache;
 }
 
 const DEFAULT_READY_TTL_MS = 30_000;
@@ -60,6 +68,7 @@ export function createApp(deps: AppDeps) {
     maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
     allowedOrigins,
     auditSink = new NullAuditSink(),
+    idempotencyCache,
   } = deps;
 
   const app = new Hono<{ Variables: Variables }>();
@@ -154,13 +163,17 @@ export function createApp(deps: AppDeps) {
     const requestId = c.get("requestId");
     const start = Date.now();
     activeRequests.add(1, { operation: "settle" });
-    // Builds up as we learn details; committed in finally only if a settle was actually attempted.
-    const audit: Partial<AuditRecord> & { attempted: boolean } = {
-      timestamp: new Date().toISOString(),
-      requestId,
-      operation: "settle",
-      attempted: false,
-    };
+
+    let attempted = false;
+    let shared: {
+      network?: string;
+      scheme?: string;
+      asset?: string;
+      amount?: string;
+      payTo?: string;
+    } = {};
+    const complete: Partial<AuditCompleteRecord> = {};
+
     try {
       const { paymentPayload, paymentRequirements } = await c.req.json<{
         paymentPayload: PaymentPayload;
@@ -171,23 +184,72 @@ export function createApp(deps: AppDeps) {
         return c.json({ error: "Missing paymentPayload or paymentRequirements", requestId }, 400);
       }
 
-      Object.assign(audit, {
-        attempted: true,
+      // Idempotency: same signed tx + requirements → return prior response.
+      // Protects against client retries after timeouts and prevents logging
+      // the same settle twice in the audit trail.
+      const idemKey = idempotencyCache ? idempotencyKey(paymentPayload, paymentRequirements) : null;
+      if (idemKey && idempotencyCache) {
+        const cached = idempotencyCache.get(idemKey);
+        if (cached) {
+          c.header("X-Idempotent-Replay", "cached");
+          return c.json(cached.response as object, cached.statusCode as 200 | 400 | 500);
+        }
+        const inflight = idempotencyCache.inflight(idemKey);
+        if (inflight) {
+          c.header("X-Idempotent-Replay", "coalesced");
+          const result = await inflight;
+          return c.json(result.response as object, result.statusCode as 200 | 400 | 500);
+        }
+      }
+
+      shared = {
         network: paymentRequirements.network,
         scheme: paymentRequirements.scheme,
         asset: paymentRequirements.asset,
         amount: paymentRequirements.amount,
         payTo: paymentRequirements.payTo,
-      });
+      };
 
-      const response = await facilitator.settle(paymentPayload, paymentRequirements);
+      const attempt: AuditAttemptRecord = {
+        timestamp: new Date().toISOString(),
+        requestId,
+        operation: "settle",
+        phase: "attempt",
+        ...shared,
+      };
+
+      // Reserve the in-flight promise SYNCHRONOUSLY — before any await — so a
+      // concurrent duplicate arriving during our audit pre-write or settle call
+      // coalesces on this single upstream call instead of starting its own.
+      // The inner async IIFE enforces invariant ordering: audit attempt is
+      // durable before facilitator.settle is invoked.
+      const settlePromise = (async () => {
+        try {
+          await auditSink.record(attempt);
+        } catch (err) {
+          logger.error("Audit attempt write failed", {
+            requestId,
+            error: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+        const response = await facilitator.settle(paymentPayload, paymentRequirements);
+        return { statusCode: 200, response, cachedAt: 0 };
+      })();
+      if (idemKey && idempotencyCache) idempotencyCache.reserve(idemKey, settlePromise);
+      attempted = true;
+
+      const { response } = await settlePromise;
       settleDuration.record(Date.now() - start, { result: response.success ? "success" : "failure" });
 
-      audit.result = response.success ? "success" : "failure";
-      audit.payer = typeof response.payer === "string" ? response.payer : undefined;
-      audit.transaction = typeof response.transaction === "string" ? response.transaction : undefined;
+      complete.result = response.success ? "success" : "failure";
+      complete.payer = typeof response.payer === "string" ? response.payer : undefined;
+      complete.transaction = typeof response.transaction === "string" ? response.transaction : undefined;
       if (!response.success && typeof response.invalidReason === "string") {
-        audit.error = response.invalidReason;
+        complete.error = response.invalidReason;
+      }
+
+      if (idemKey && idempotencyCache) {
+        idempotencyCache.put(idemKey, { statusCode: 200, response });
       }
       return c.json(response);
     } catch (error) {
@@ -198,20 +260,30 @@ export function createApp(deps: AppDeps) {
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,
       });
-      if (audit.attempted) {
-        audit.result = "error";
-        audit.error = error instanceof Error ? error.message.slice(0, 500) : "Unknown error";
+      if (attempted) {
+        complete.result = "error";
+        complete.error = error instanceof Error ? error.message.slice(0, 500) : "Unknown error";
       }
       return c.json({ error: "Internal error", requestId }, 500);
     } finally {
       activeRequests.add(-1, { operation: "settle" });
-      if (audit.attempted) {
-        audit.durationMs = Date.now() - start;
-        const { attempted: _attempted, ...finalRecord } = audit;
+      if (attempted) {
+        const completeRecord: AuditCompleteRecord = {
+          timestamp: new Date().toISOString(),
+          requestId,
+          operation: "settle",
+          phase: "complete",
+          result: complete.result ?? "error",
+          durationMs: Date.now() - start,
+          ...shared,
+          payer: complete.payer,
+          transaction: complete.transaction,
+          error: complete.error,
+        };
         try {
-          await auditSink.record(finalRecord as AuditRecord);
+          await auditSink.record(completeRecord);
         } catch (err) {
-          logger.error("Audit sink write failed", {
+          logger.error("Audit complete write failed", {
             requestId,
             error: err instanceof Error ? err.message : "Unknown error",
           });

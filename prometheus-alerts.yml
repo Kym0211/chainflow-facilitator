@@ -93,3 +93,36 @@ groups:
         annotations:
           summary: "Sustained high in-flight request count"
           description: "{{ $value }} requests in flight for 5m on {{ $labels.operation }}. Either legitimate load (consider scaling) or stuck requests (consider timeouts)."
+
+  - name: chainflow-facilitator.wallet
+    rules:
+      # Warn before the wallet is dangerously low. 0.1 SOL ≈ ~20k txs at
+      # typical priority fees; tune for your expected settle volume.
+      - alert: LowWalletBalance
+        expr: facilitator_wallet_balance_lamports < 100000000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Facilitator wallet SOL balance is low"
+          description: "Balance is {{ $value }} lamports. The facilitator pays Solana transaction fees — once it runs out, settles start failing. Top up the wallet promptly."
+
+      # Critical: below the point where a handful of settles exhausts the wallet.
+      - alert: CriticalWalletBalance
+        expr: facilitator_wallet_balance_lamports < 10000000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Facilitator wallet near-empty"
+          description: "Balance is {{ $value }} lamports (<0.01 SOL). Settle failures imminent. Emergency top-up required."
+
+      # Catches a broken poller just as well as on-chain drain.
+      - alert: WalletBalanceStale
+        expr: absent(facilitator_wallet_balance_lamports)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Wallet balance metric absent"
+          description: "No wallet balance reading for 10m. Poller may be stuck or RPC unreachable — investigate."

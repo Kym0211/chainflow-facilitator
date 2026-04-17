@@ -10,6 +10,8 @@ import { verifyCounter, settleCounter, shutdownMetrics } from "./metrics.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { logger } from "./logger.js";
 import { createFailoverRpc, parseRpcUrls } from "./rpc.js";
+import { InMemoryIdempotencyCache } from "./idempotency.js";
+import { startBalancePoller } from "./wallet-balance.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -23,6 +25,8 @@ const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH?.trim();
+const BALANCE_POLL_INTERVAL_MS = parseInt(process.env.BALANCE_POLL_INTERVAL_MS || "60000");
+const IDEMPOTENCY_TTL_MS = parseInt(process.env.IDEMPOTENCY_TTL_MS || "600000"); // 10 min default
 
 const RPC_URLS = parseRpcUrls();
 if (RPC_URLS.length === 0) {
@@ -77,6 +81,14 @@ const readinessProbe: ReadinessProbe = async () => {
   }
 };
 
+const balancePoller = startBalancePoller({
+  rpc: failoverRpc,
+  address: keypair.address,
+  intervalMs: BALANCE_POLL_INTERVAL_MS,
+});
+
+const idempotencyCache = new InMemoryIdempotencyCache(IDEMPOTENCY_TTL_MS);
+
 const app = createApp({
   facilitator,
   rateLimiter,
@@ -86,6 +98,7 @@ const app = createApp({
   network: NETWORK,
   allowedOrigins: ALLOWED_ORIGINS,
   auditSink,
+  idempotencyCache,
 });
 
 const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
@@ -118,6 +131,8 @@ const shutdown = async (signal: string) => {
     });
     logger.info("HTTP server closed");
 
+    balancePoller.stop();
+
     await shutdownMetrics();
     logger.info("Metrics exporter closed");
 
@@ -125,6 +140,7 @@ const shutdown = async (signal: string) => {
     logger.info("Audit sink closed");
 
     rateLimiter.dispose();
+    idempotencyCache.dispose();
 
     clearTimeout(forceExit);
     process.exit(0);
