@@ -1,5 +1,6 @@
 import { PrometheusExporter } from "@opentelemetry/exporter-prometheus";
 import { MeterProvider } from "@opentelemetry/sdk-metrics";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 
 const METRICS_PORT = 9464; // Standard Prometheus exporter port
 
@@ -11,6 +12,9 @@ const exporter = new PrometheusExporter({ port: METRICS_PORT }, () => {
 
 // Create a meter provider and register the exporter
 const meterProvider = new MeterProvider({
+  resource: resourceFromAttributes({
+    "service.name": "chainflow-facilitator",
+  }),
   readers: [exporter],
 });
 

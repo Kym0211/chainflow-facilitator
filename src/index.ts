@@ -8,6 +8,7 @@ import { ExactSvmScheme } from "@x402/svm/exact/facilitator";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import { verifyCounter, settleCounter, verifyDuration, settleDuration, activeRequests } from "./metrics.js";
 import { RateLimiter } from "./rate-limiter.js";
+import { logger } from "./logger.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -29,7 +30,7 @@ const privateKeyBytes = SVM_PRIVATE_KEY.startsWith("[")
   : base58.decode(SVM_PRIVATE_KEY);
 
 const keypair = await createKeyPairSignerFromBytes(privateKeyBytes);
-console.log(`Facilitator wallet: ${keypair.address}`);
+logger.info("Wallet loaded", { address: keypair.address.toString() });
 
 const svmSigner = toFacilitatorSvmSigner(keypair, {
   defaultRpcUrl: RPC_URL,
@@ -105,7 +106,7 @@ app.post("/verify", async (c) => {
     return c.json(response);
   } catch (error) {
     verifyDuration.record(Date.now() - start, { result: "error" });
-    console.error("Verify error:", error);
+    logger.error("Verify error", { error: error instanceof Error ? error.message : "Unknown error" });
     return c.json({ error: error instanceof Error ? error.message : "Unknown error" }, 500);
   }
 });
@@ -127,7 +128,7 @@ app.post("/settle", async (c) => {
     return c.json(response);
   } catch (error) {
     settleDuration.record(Date.now() - start, { result: "error" });
-    console.error("Settle error:", error);
+    logger.error("Settle error", { error: error instanceof Error ? error.message : "Unknown error" });
     return c.json({ error: error instanceof Error ? error.message : "Unknown error" }, 500);
   }
 });
@@ -137,7 +138,7 @@ app.get("/supported", (c) => {
     const response = facilitator.getSupported();
     return c.json(response);
   } catch (error) {
-    console.error("Supported error:", error);
+    logger.error("Supported error", { error: error instanceof Error ? error.message : "Unknown error" });
     return c.json({ error: error instanceof Error ? error.message : "Unknown error" }, 500);
   } 
 });
@@ -156,6 +157,7 @@ app.get("/health", async (c) => {
       wallet: keypair.address.toString(),
     });
   } catch (error) {
+    logger.error("Health check failed", { error: error instanceof Error ? error.message : "Unknown error" });
     return c.json({
       status: "degraded",
       rpc: "unreachable",
@@ -165,7 +167,10 @@ app.get("/health", async (c) => {
 });
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log(`Chainflow facilitator running on http://localhost:${info.port}`);
-  console.log(`Network: Solana mainnet (5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp)`);
-  console.log(`RPC: ${RPC_URL || "default (public)"}`);
+  logger.info("Facilitator started", {
+    port: info.port,
+    network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+    rpc: RPC_URL || "default",
+    wallet: keypair.address.toString(),
+  });
 });
