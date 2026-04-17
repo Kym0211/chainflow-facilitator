@@ -1,7 +1,7 @@
 import {
   createKeyPairSignerFromBytes,
   createSolanaRpc,
-  devnet,
+  mainnet,
   createTransactionMessage,
   setTransactionMessageFeePayer,
   setTransactionMessageLifetimeUsingBlockhash,
@@ -25,20 +25,20 @@ import { readFileSync } from "fs";
 dotenv.config();
 
 const FACILITATOR_URL = "http://localhost:4022";
-const NETWORK = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
-const USDC_MINT = address("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+const NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+const USDC_MINT = address("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 const FACILITATOR_ADDRESS = address("G1pPBqcvtQb2X2AbbeHPeeBKFcF7PSQ2ucDEk7Z5CMng");
 
 // Load buyer keypair from file
 const buyerKeyBytes = new Uint8Array(JSON.parse(readFileSync("buyer.json", "utf-8")));
-const buyer = await createKeyPairSignerFromBytes(buyerKeyBytes);
+const buyer = await createKeyPairSignerFromBytes(buyerKeyBytes); //DfStJHxreUdAB2zVZEzCDyYmFoj7YuT4bsqyfg55JJXd
 console.log(`Buyer: ${buyer.address}`);
 
-// Recipient — for testing, we'll just send USDC to the facilitator wallet
-const RECIPIENT = FACILITATOR_ADDRESS;
+// Merchant — the resource provider who receives the USDC payment
+const MERCHANT = address("GTS6smH1adsF4egSpfEDbBKWZkGyxEe9e8abfA29LWfz");
 const AMOUNT = 1000n; // 0.001 USDC (6 decimals)
 
-const rpc = createSolanaRpc(devnet(process.env.RPC_URL!));
+const rpc = createSolanaRpc(mainnet(process.env.RPC_URL!));
 
 
 // Get recent blockhash
@@ -56,7 +56,7 @@ console.log(`Buyer ATA: ${buyerATA}`);
 // Find the recipient's USDC token account (ATA)
 const [recipientATA] = await findAssociatedTokenPda({
   mint: USDC_MINT,
-  owner: RECIPIENT,
+  owner: MERCHANT,
   tokenProgram: TOKEN_PROGRAM_ADDRESS,
 });
 console.log(`Recipient ATA: ${recipientATA}`);
@@ -67,7 +67,7 @@ const message = appendTransactionMessageInstructions(
     // Instruction 1: Compute unit limit
     getSetComputeUnitLimitInstruction({ units: 20_000 }),
     // Instruction 2: Compute unit price
-    getSetComputeUnitPriceInstruction({ microLamports: 1n }),
+    getSetComputeUnitPriceInstruction({ microLamports: 100_000n }),
     // Instruction 3: USDC transfer
     getTransferCheckedInstruction({
       source: buyerATA,
@@ -107,7 +107,7 @@ const paymentPayload = {
     network: NETWORK,
     asset: USDC_MINT.toString(),
     amount: AMOUNT.toString(),
-    payTo: RECIPIENT.toString(),
+    payTo: MERCHANT.toString(),
     maxTimeoutSeconds: 300,
     extra: { feePayer: FACILITATOR_ADDRESS.toString() },
   },
@@ -121,7 +121,7 @@ const paymentRequirements = {
   network: NETWORK,
   asset: USDC_MINT.toString(),
   amount: AMOUNT.toString(),
-  payTo: RECIPIENT.toString(),
+  payTo: MERCHANT.toString(),
   maxTimeoutSeconds: 300,
   extra: { feePayer: FACILITATOR_ADDRESS.toString() },
 };
@@ -152,5 +152,5 @@ const settleResult = (await settleRes.json()) as { success: boolean; transaction
 console.log("Settle result:", JSON.stringify(settleResult, null, 2));
 
 if (settleResult.success) {
-  console.log(`\nTransaction: https://explorer.solana.com/tx/${settleResult.transaction}?cluster=devnet`);
+  console.log(`\nTransaction: https://explorer.solana.com/tx/${settleResult.transaction}`);
 }
