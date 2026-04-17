@@ -1,0 +1,14 @@
+node_modules
+dist
+.env
+*.log
+buyer.json
+merchant.json
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+prometheus.yml
+README.md
+.claude

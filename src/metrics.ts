@@ -18,6 +18,10 @@ const meterProvider = new MeterProvider({
   readers: [exporter],
 });
 
+export async function shutdownMetrics(): Promise<void> {
+  await meterProvider.shutdown();
+}
+
 // Create a meter — this is what we use to create individual metrics
 const meter = meterProvider.getMeter("chainflow-facilitator");
 

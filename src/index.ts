@@ -1,24 +1,22 @@
 import { serve } from "@hono/node-server";
-import { Hono } from "hono";
 import { base58 } from "@scure/base";
 import { createKeyPairSignerFromBytes, createSolanaRpc, mainnet } from "@solana/kit";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { toFacilitatorSvmSigner } from "@x402/svm";
 import { ExactSvmScheme } from "@x402/svm/exact/facilitator";
-import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
-import { verifyCounter, settleCounter, verifyDuration, settleDuration, activeRequests } from "./metrics.js";
+import { createApp, type ReadinessProbe } from "./app.js";
+import { verifyCounter, settleCounter, shutdownMetrics } from "./metrics.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { logger } from "./logger.js";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-// 100 requests per minute per IP — generous for early stage
-const rateLimiter = new RateLimiter(100, 60_000);
-
+const NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const PORT = parseInt(process.env.PORT || "4022");
 const RPC_URL = process.env.RPC_URL;
 const SVM_PRIVATE_KEY = process.env.SVM_PRIVATE_KEY;
+const TRUST_PROXY = process.env.TRUST_PROXY === "true";
 
 if (!SVM_PRIVATE_KEY) {
   console.error("SVM_PRIVATE_KEY is required in .env");
@@ -37,140 +35,78 @@ const svmSigner = toFacilitatorSvmSigner(keypair, {
 });
 
 const facilitator = new x402Facilitator()
-  .onBeforeVerify(async () => {
-    activeRequests.add(1, { operation: "verify" });
-  })
-  .onAfterVerify(async () => {
-    activeRequests.add(-1, { operation: "verify" });
-    verifyCounter.add(1, { result: "success" });
-  })
-  .onVerifyFailure(async () => {
-    activeRequests.add(-1, { operation: "verify" });
-    verifyCounter.add(1, { result: "failure" });
-  })
-  .onBeforeSettle(async () => {
-    activeRequests.add(1, { operation: "settle" });
-  })
-  .onAfterSettle(async () => {
-    activeRequests.add(-1, { operation: "settle" });
-    settleCounter.add(1, { result: "success" });
-  })
-  .onSettleFailure(async () => {
-    activeRequests.add(-1, { operation: "settle" });
-    settleCounter.add(1, { result: "failure" });
-  });
+  .onAfterVerify(async () => verifyCounter.add(1, { result: "success" }))
+  .onVerifyFailure(async () => verifyCounter.add(1, { result: "failure" }))
+  .onAfterSettle(async () => settleCounter.add(1, { result: "success" }))
+  .onSettleFailure(async () => settleCounter.add(1, { result: "failure" }));
 
-facilitator.register(
-  "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-  new ExactSvmScheme(svmSigner)
-);   // for mainnet 
+facilitator.register(NETWORK, new ExactSvmScheme(svmSigner));
 
-// facilitator.register(
-//   "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
-//   new ExactSvmScheme(svmSigner)
-// );   // for devnet
+const rateLimiter = new RateLimiter(100, 60_000);
 
-const app = new Hono();
-
-// Rate limiting middleware
-app.use("*", async (c, next) => {
-  const path = c.req.path;
-  if (path === "/health" || path === "/supported") {
-    return next();
-  }
-
-  const ip = c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "unknown";
-
-  if (!rateLimiter.isAllowed(ip)) {
-    return c.json({ error: "Rate limit exceeded. Try again later." }, 429);
-  }
-
-  c.header("X-RateLimit-Remaining", rateLimiter.remaining(ip).toString());
-  return next();
-});
-
-app.post("/verify", async (c) => {
-  const start = Date.now();
+const readinessProbe: ReadinessProbe = async () => {
   try {
-    const { paymentPayload, paymentRequirements } = await c.req.json<{
-      paymentPayload: PaymentPayload;
-      paymentRequirements: PaymentRequirements;
-    }>();
-
-    if (!paymentPayload || !paymentRequirements) {
-      return c.json({ error: "Missing paymentPayload or paymentRequirements" }, 400);
-    }
-
-    const response = await facilitator.verify(paymentPayload, paymentRequirements);
-    verifyDuration.record(Date.now() - start, { result: response.isValid ? "success" : "failure" });
-    return c.json(response);
-  } catch (error) {
-    verifyDuration.record(Date.now() - start, { result: "error" });
-    logger.error("Verify error", { error: error instanceof Error ? error.message : "Unknown error" });
-    return c.json({ error: error instanceof Error ? error.message : "Unknown error" }, 500);
-  }
-});
-
-app.post("/settle", async (c) => {
-  const start = Date.now();
-  try {
-    const { paymentPayload, paymentRequirements } = await c.req.json<{
-      paymentPayload: PaymentPayload;
-      paymentRequirements: PaymentRequirements;
-    }>();
-
-    if (!paymentPayload || !paymentRequirements) {
-      return c.json({ error: "Missing paymentPayload or paymentRequirements" }, 400);
-    }
-
-    const response = await facilitator.settle(paymentPayload, paymentRequirements);
-    settleDuration.record(Date.now() - start, { result: response.success ? "success" : "failure" });
-    return c.json(response);
-  } catch (error) {
-    settleDuration.record(Date.now() - start, { result: "error" });
-    logger.error("Settle error", { error: error instanceof Error ? error.message : "Unknown error" });
-    return c.json({ error: error instanceof Error ? error.message : "Unknown error" }, 500);
-  }
-});
-
-app.get("/supported", (c) => {
-  try {
-    const response = facilitator.getSupported();
-    return c.json(response);
-  } catch (error) {
-    logger.error("Supported error", { error: error instanceof Error ? error.message : "Unknown error" });
-    return c.json({ error: error instanceof Error ? error.message : "Unknown error" }, 500);
-  } 
-});
-
-app.get("/health", async (c) => {
-  try {
-    // Check if we can reach the Solana RPC
     const rpc = createSolanaRpc(mainnet(RPC_URL!));
     const { value } = await rpc.getLatestBlockhash().send();
-
-    return c.json({
-      status: "ok",
-      network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-      rpc: "connected",
-      blockhash: value.blockhash,
-      wallet: keypair.address.toString(),
-    });
+    return { ok: true, blockhash: value.blockhash };
   } catch (error) {
-    logger.error("Health check failed", { error: error instanceof Error ? error.message : "Unknown error" });
-    return c.json({
-      status: "degraded",
-      rpc: "unreachable",
-      error: error instanceof Error ? error.message : "Unknown error",
-    }, 503);
+    return { ok: false, reason: error instanceof Error ? error.message : "Unknown error" };
   }
+};
+
+const app = createApp({
+  facilitator,
+  rateLimiter,
+  readinessProbe,
+  walletAddress: keypair.address.toString(),
+  trustProxy: TRUST_PROXY,
+  network: NETWORK,
 });
 
-serve({ fetch: app.fetch, port: PORT }, (info) => {
+const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
   logger.info("Facilitator started", {
     port: info.port,
-    network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+    network: NETWORK,
     rpc: RPC_URL || "default",
     wallet: keypair.address.toString(),
   });
 });
+
+// Graceful shutdown: stop accepting connections, drain in-flight, flush metrics, exit.
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+let shuttingDown = false;
+
+const shutdown = async (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info("Shutdown initiated", { signal });
+
+  const forceExit = setTimeout(() => {
+    logger.warn("Forcing shutdown after timeout", { timeoutMs: SHUTDOWN_TIMEOUT_MS });
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  forceExit.unref();
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+    logger.info("HTTP server closed");
+
+    await shutdownMetrics();
+    logger.info("Metrics exporter closed");
+
+    rateLimiter.dispose();
+
+    clearTimeout(forceExit);
+    process.exit(0);
+  } catch (error) {
+    logger.error("Shutdown error", {
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+    process.exit(1);
+  }
+};
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
