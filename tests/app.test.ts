@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, type FacilitatorLike, type ReadinessProbe } from "../src/app.js";
 import { RateLimiter } from "../src/rate-limiter.js";
+import { InMemoryAuditSink } from "../src/audit.js";
 
 function buildDeps(overrides: Partial<Parameters<typeof createApp>[0]> = {}) {
   const facilitator: FacilitatorLike = {
@@ -145,6 +146,137 @@ describe("createApp", () => {
     });
   });
 
+  describe("audit log", () => {
+    const settleBody = {
+      paymentPayload: { x402Version: 2 },
+      paymentRequirements: {
+        scheme: "exact",
+        network: "solana:test",
+        asset: "USDC",
+        amount: "1000",
+        payTo: "merchant-addr",
+      },
+    };
+
+    it("writes one success record per successful settle", async () => {
+      const sink = new InMemoryAuditSink();
+      const d = buildDeps({ auditSink: sink });
+      const app2 = createApp(d);
+
+      const res = await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      expect(res.status).toBe(200);
+      expect(sink.records).toHaveLength(1);
+      expect(sink.records[0]).toMatchObject({
+        operation: "settle",
+        result: "success",
+        transaction: "sig-123",
+        network: "solana:test",
+        asset: "USDC",
+        amount: "1000",
+        payTo: "merchant-addr",
+      });
+      expect(sink.records[0].requestId).toBeDefined();
+      expect(sink.records[0].durationMs).toBeGreaterThanOrEqual(0);
+      d.rateLimiter.dispose();
+    });
+
+    it("writes a failure record when facilitator reports success=false", async () => {
+      const sink = new InMemoryAuditSink();
+      const d = buildDeps({
+        facilitator: {
+          verify: vi.fn(),
+          settle: vi.fn(async () => ({
+            success: false,
+            invalidReason: "transaction_simulation_failed",
+          })),
+          getSupported: vi.fn(() => ({ kinds: [] })),
+        },
+        auditSink: sink,
+      });
+      const app2 = createApp(d);
+
+      await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      expect(sink.records).toHaveLength(1);
+      expect(sink.records[0]).toMatchObject({
+        result: "failure",
+        error: "transaction_simulation_failed",
+      });
+      d.rateLimiter.dispose();
+    });
+
+    it("writes an error record when the facilitator throws", async () => {
+      const sink = new InMemoryAuditSink();
+      const d = buildDeps({
+        facilitator: {
+          verify: vi.fn(),
+          settle: vi.fn(async () => {
+            throw new Error("RPC unreachable");
+          }),
+          getSupported: vi.fn(() => ({ kinds: [] })),
+        },
+        auditSink: sink,
+      });
+      const app2 = createApp(d);
+
+      const res = await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      expect(res.status).toBe(500);
+      expect(sink.records).toHaveLength(1);
+      expect(sink.records[0]).toMatchObject({
+        result: "error",
+        error: "RPC unreachable",
+      });
+      d.rateLimiter.dispose();
+    });
+
+    it("skips audit when the request is rejected before a settle is attempted", async () => {
+      const sink = new InMemoryAuditSink();
+      const d = buildDeps({ auditSink: sink });
+      const app2 = createApp(d);
+
+      // Missing paymentPayload + paymentRequirements → 400, no settle attempted.
+      const res = await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(400);
+      expect(sink.records).toHaveLength(0);
+      d.rateLimiter.dispose();
+    });
+
+    it("does not block the handler if the sink fails", async () => {
+      const flaky = {
+        record: vi.fn(async () => {
+          throw new Error("disk full");
+        }),
+        close: vi.fn(async () => {}),
+      };
+      const d = buildDeps({ auditSink: flaky });
+      const app2 = createApp(d);
+
+      const res = await app2.request("/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settleBody),
+      });
+      expect(res.status).toBe(200);
+      expect(flaky.record).toHaveBeenCalled();
+      d.rateLimiter.dispose();
+    });
+  });
+
   describe("X-Request-Id", () => {
     it("mints a request id when none is provided", async () => {
       const res = await app.request("/livez");
@@ -200,6 +332,62 @@ describe("createApp", () => {
         expect(res.status).toBe(200);
       }
       limited.rateLimiter.dispose();
+    });
+  });
+
+  describe("CORS", () => {
+    it("omits CORS headers entirely when no allowlist is configured", async () => {
+      const res = await app.request("/livez", {
+        headers: { Origin: "https://random.example" },
+      });
+      expect(res.headers.get("access-control-allow-origin")).toBeNull();
+    });
+
+    it("echoes an allowed origin on simple requests", async () => {
+      const withCors = buildDeps({ allowedOrigins: ["https://app.example"] });
+      const app2 = createApp(withCors);
+      const res = await app2.request("/livez", {
+        headers: { Origin: "https://app.example" },
+      });
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://app.example");
+      withCors.rateLimiter.dispose();
+    });
+
+    it("refuses a disallowed origin", async () => {
+      const withCors = buildDeps({ allowedOrigins: ["https://app.example"] });
+      const app2 = createApp(withCors);
+      const res = await app2.request("/livez", {
+        headers: { Origin: "https://evil.example" },
+      });
+      expect(res.headers.get("access-control-allow-origin")).toBeNull();
+      withCors.rateLimiter.dispose();
+    });
+
+    it("handles preflight OPTIONS for allowed origin", async () => {
+      const withCors = buildDeps({ allowedOrigins: ["https://app.example"] });
+      const app2 = createApp(withCors);
+      const res = await app2.request("/verify", {
+        method: "OPTIONS",
+        headers: {
+          Origin: "https://app.example",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "Content-Type",
+        },
+      });
+      expect(res.status).toBe(204);
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://app.example");
+      expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+      withCors.rateLimiter.dispose();
+    });
+
+    it("supports wildcard when '*' is in the allowlist", async () => {
+      const withCors = buildDeps({ allowedOrigins: ["*"] });
+      const app2 = createApp(withCors);
+      const res = await app2.request("/livez", {
+        headers: { Origin: "https://anything.example" },
+      });
+      expect(res.headers.get("access-control-allow-origin")).toBe("https://anything.example");
+      withCors.rateLimiter.dispose();
     });
   });
 });

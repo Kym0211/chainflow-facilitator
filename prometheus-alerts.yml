@@ -1,0 +1,95 @@
+groups:
+  - name: chainflow-facilitator.availability
+    rules:
+      - alert: FacilitatorDown
+        expr: up{job="chainflow-facilitator"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Facilitator /metrics scrape failing"
+          description: "Prometheus cannot reach the facilitator at {{ $labels.instance }}. Likely the process crashed, the container is restarting, or the network path is broken."
+
+      - alert: FacilitatorScrapeFlapping
+        expr: changes(up{job="chainflow-facilitator"}[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Facilitator scrape target flapping"
+          description: "The /metrics endpoint has gone up/down {{ $value }} times in the last 10m. Check container restarts, OOM kills, or RPC failover exhaustion."
+
+  - name: chainflow-facilitator.errors
+    rules:
+      - alert: HighVerifyErrorRate
+        # 10% failure rate over 5m, only fires once traffic is non-trivial.
+        expr: |
+          (
+            sum(rate(facilitator_verify_total{result="failure"}[5m]))
+            /
+            sum(rate(facilitator_verify_total[5m]))
+          ) > 0.10
+          and
+          sum(rate(facilitator_verify_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated /verify failure rate"
+          description: "More than 10% of /verify calls have failed over the last 5m ({{ $value | humanizePercentage }}). Inspect recent 'Verify error' log lines for root cause."
+
+      - alert: HighSettleErrorRate
+        # Settle failures are costly — tighter threshold, shorter "for".
+        expr: |
+          (
+            sum(rate(facilitator_settle_total{result="failure"}[5m]))
+            /
+            sum(rate(facilitator_settle_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(facilitator_settle_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Elevated /settle failure rate"
+          description: "More than 5% of /settle calls have failed over the last 5m ({{ $value | humanizePercentage }}). Money movement is degraded. Check RPC health, settle error logs, and on-chain balances."
+
+  - name: chainflow-facilitator.latency
+    rules:
+      - alert: VerifyLatencyHighP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(facilitator_verify_duration_ms_bucket[5m])) by (le)
+          ) > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "/verify P95 latency above 5s"
+          description: "P95 verify latency is {{ $value | humanize }}ms over the last 5m. Usually indicates slow or failing primary RPC; expect failover logs."
+
+      - alert: SettleLatencyHighP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(facilitator_settle_duration_ms_bucket[5m])) by (le)
+          ) > 15000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "/settle P95 latency above 15s"
+          description: "P95 settle latency is {{ $value | humanize }}ms over the last 5m. Solana confirmation times vary, but sustained 15s+ indicates RPC or network issues."
+
+  - name: chainflow-facilitator.saturation
+    rules:
+      - alert: ActiveRequestsSaturated
+        expr: facilitator_active_requests > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained high in-flight request count"
+          description: "{{ $value }} requests in flight for 5m on {{ $labels.operation }}. Either legitimate load (consider scaling) or stuck requests (consider timeouts)."

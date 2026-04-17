@@ -5,6 +5,7 @@ import { x402Facilitator } from "@x402/core/facilitator";
 import { toFacilitatorSvmSigner } from "@x402/svm";
 import { ExactSvmScheme } from "@x402/svm/exact/facilitator";
 import { createApp, type ReadinessProbe } from "./app.js";
+import { JsonlFileSink, NullAuditSink, type AuditSink } from "./audit.js";
 import { verifyCounter, settleCounter, shutdownMetrics } from "./metrics.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { logger } from "./logger.js";
@@ -17,6 +18,11 @@ const NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const PORT = parseInt(process.env.PORT || "4022");
 const SVM_PRIVATE_KEY = process.env.SVM_PRIVATE_KEY;
 const TRUST_PROXY = process.env.TRUST_PROXY === "true";
+const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH?.trim();
 
 const RPC_URLS = parseRpcUrls();
 if (RPC_URLS.length === 0) {
@@ -53,6 +59,15 @@ facilitator.register(NETWORK, new ExactSvmScheme(svmSigner));
 
 const rateLimiter = new RateLimiter(100, 60_000);
 
+const auditSink: AuditSink = AUDIT_LOG_PATH
+  ? new JsonlFileSink(AUDIT_LOG_PATH)
+  : new NullAuditSink();
+if (AUDIT_LOG_PATH) {
+  logger.info("Audit log enabled", { path: AUDIT_LOG_PATH });
+} else {
+  logger.warn("Audit log disabled — set AUDIT_LOG_PATH to enable durable settle records");
+}
+
 const readinessProbe: ReadinessProbe = async () => {
   try {
     const { value } = await failoverRpc.getLatestBlockhash().send();
@@ -69,6 +84,8 @@ const app = createApp({
   walletAddress: keypair.address.toString(),
   trustProxy: TRUST_PROXY,
   network: NETWORK,
+  allowedOrigins: ALLOWED_ORIGINS,
+  auditSink,
 });
 
 const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
@@ -103,6 +120,9 @@ const shutdown = async (signal: string) => {
 
     await shutdownMetrics();
     logger.info("Metrics exporter closed");
+
+    await auditSink.close();
+    logger.info("Audit sink closed");
 
     rateLimiter.dispose();
 

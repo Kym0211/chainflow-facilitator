@@ -1,0 +1,60 @@
+global:
+  # Proton Mail SMTP submission (paid plans only).
+  smtp_smarthost: "smtp.protonmail.ch:587"
+  smtp_from: "kavyam@chainflow.io"
+  smtp_auth_username: "kavyam@chainflow.io"
+  # Token is mounted from a gitignored file — see docker-compose.yml.
+  smtp_auth_password_file: "/etc/alertmanager/smtp-password"
+  smtp_require_tls: true
+  smtp_hello: "chainflow-facilitator"
+
+  # If a firing alert doesn't receive a resolve within this window,
+  # Alertmanager re-notifies. Keeps reality in sync if a downstream is slow.
+  resolve_timeout: 5m
+
+route:
+  # Group alerts that share these labels into one email to cut noise.
+  group_by: ["alertname", "severity"]
+  # Wait this long after the first alert to batch follow-ups into the same email.
+  group_wait: 30s
+  # Wait this long before sending a new email for the same group if new alerts fire.
+  group_interval: 5m
+  # Re-send an unresolved alert every 4h so it doesn't get forgotten.
+  repeat_interval: 4h
+  receiver: "chainflow-ops"
+
+  routes:
+    # Critical alerts: faster batching and repeat cadence.
+    - matchers:
+        - severity="critical"
+      receiver: "chainflow-ops"
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+
+receivers:
+  - name: "chainflow-ops"
+    email_configs:
+      # `to` is the SMTP envelope — every address listed actually receives the mail.
+      # `headers.To` rewrites the visible header so only kavyam appears; the rest
+      # are effectively BCC'd (no header mentions them).
+      # - to: "kavyam@chainflow.io,sofia@chainflow.io,nico@chainflow.io,devopsx@chainflow.io,chris@chainflow.io"
+      - to: "kavyam@chainflow.io"
+        send_resolved: true
+        headers:
+          To: "kavyam@chainflow.io"
+          Subject: "[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})"
+        html: |
+          <h3>{{ .CommonLabels.alertname }} — {{ .Status | toUpper }}</h3>
+          <p><b>Severity:</b> {{ .CommonLabels.severity }}</p>
+          {{ range .Alerts }}
+          <hr>
+          <p><b>Summary:</b> {{ .Annotations.summary }}</p>
+          <p><b>Description:</b> {{ .Annotations.description }}</p>
+          <p><b>Started:</b> {{ .StartsAt }}</p>
+          {{ if ne .Status "firing" }}<p><b>Resolved:</b> {{ .EndsAt }}</p>{{ end }}
+          <p><b>Labels:</b><br>
+            {{ range .Labels.SortedPairs }}{{ .Name }}={{ .Value }}<br>{{ end }}
+          </p>
+          {{ end }}
+

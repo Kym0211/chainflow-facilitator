@@ -6,3 +6,6 @@ dist/
 buyer.json
 merchant.json
 .claude
+.secrets/
+audit.log
+audit.log.*
