@@ -7,9 +7,13 @@ import { toFacilitatorSvmSigner } from "@x402/svm";
 import { ExactSvmScheme } from "@x402/svm/exact/facilitator";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import { verifyCounter, settleCounter, verifyDuration, settleDuration, activeRequests } from "./metrics.js";
+import { RateLimiter } from "./rate-limiter.js";
 import dotenv from "dotenv";
 
 dotenv.config();
+
+// 100 requests per minute per IP — generous for early stage
+const rateLimiter = new RateLimiter(100, 60_000);
 
 const PORT = parseInt(process.env.PORT || "4022");
 const RPC_URL = process.env.RPC_URL;
@@ -66,6 +70,23 @@ facilitator.register(
 // );   // for devnet
 
 const app = new Hono();
+
+// Rate limiting middleware
+app.use("*", async (c, next) => {
+  const path = c.req.path;
+  if (path === "/health" || path === "/supported") {
+    return next();
+  }
+
+  const ip = c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "unknown";
+
+  if (!rateLimiter.isAllowed(ip)) {
+    return c.json({ error: "Rate limit exceeded. Try again later." }, 429);
+  }
+
+  c.header("X-RateLimit-Remaining", rateLimiter.remaining(ip).toString());
+  return next();
+});
 
 app.post("/verify", async (c) => {
   const start = Date.now();
