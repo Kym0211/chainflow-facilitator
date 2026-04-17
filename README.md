@@ -44,7 +44,45 @@ independently and all endpoints serve every registered network automatically.
 Full request/response shapes, headers, and a runnable end-to-end example are
 in [`docs/api.md`](docs/api.md).
 
-## Quickstart
+## Using Chainflow
+
+Most users don't need to run this service themselves. Point your resource
+server or client at the hosted endpoint:
+
+```
+https://facilitator.chainflow.io
+```
+
+No API key, no deployment, no Solana wallet on your side. The hosted instance
+owns the fee-payer wallet and routes every settlement through Chainflow's
+staked validator — this is where the SWQoS advantage comes from.
+
+**30-second check that it's alive:**
+
+```bash
+curl https://facilitator.chainflow.io/supported
+```
+
+**Integrating into your app** — the client flow is: call `/supported` to learn
+the fee-payer address, have the buyer partially sign a transaction with that
+fee-payer, then `POST /verify` followed by `POST /settle`. A complete runnable
+TypeScript example lives in [`docs/api.md`](docs/api.md#end-to-end-code-example).
+
+If you're building an x402 resource server (the thing returning `402 Payment
+Required`), any x402-compatible client library will work — just configure it
+to use `https://facilitator.chainflow.io` as the facilitator URL.
+
+## Self-hosting
+
+You only need to self-host if you want a private deployment, a custom scheme,
+or the ability to audit and run only code you've read. Otherwise use the
+hosted endpoint above.
+
+> **Note on SWQoS when self-hosting.** The stake-weighted QoS advantage comes
+> from broadcasting through Chainflow's staked validator, not from this code.
+> A default self-hosted instance pointing at `api.mainnet-beta.solana.com`
+> gets no SWQoS uplift. Contact us if you want to configure `RPC_URLS`
+> against the Chainflow validator endpoint.
 
 ### 1. Clone + install
 
@@ -84,9 +122,7 @@ curl http://localhost:4022/supported
 curl http://localhost:4022/readyz
 ```
 
-Then follow the full client flow in [`docs/api.md`](docs/api.md).
-
-## Docker
+### Docker
 
 ```bash
 docker compose up -d
@@ -96,7 +132,7 @@ Brings up the facilitator alongside Prometheus (`:9090`), Grafana (`:3001`),
 and Alertmanager (`:9093`). See `docker-compose.yml` for volume mounts and
 the `.secrets/` directory for SMTP credentials.
 
-## Configuration
+### Configuration
 
 All settings come from environment variables. See [`.env.example`](.env.example)
 for the full list — the most important are:
